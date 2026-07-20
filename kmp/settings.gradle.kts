@@ -1,4 +1,4 @@
-rootProject.name = "Librats"
+rootProject.name = "librats-kmp"
 
 pluginManagement {
     repositories {
