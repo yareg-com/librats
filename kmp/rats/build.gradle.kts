@@ -4,6 +4,12 @@ plugins {
 }
 
 kotlin {
+    compilerOptions {
+        freeCompilerArgs = listOf(
+            "-Xexpect-actual-classes" // TODO: Remove after expect/actual becomes stable
+        )
+    }
+
     jvm()
 
     android {

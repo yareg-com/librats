@@ -1,8 +1,8 @@
-package com.librats.jni
+package com.librats
 
 import android.util.Log
 
-class RatsJni {
+class RatsClient {
     private val tag: String
         get() = javaClass.simpleName
 
@@ -14,4 +14,9 @@ class RatsJni {
             throw e
         }
     }
+
+    val abiVersion: Int
+        get() = nativeAbi()
+
+    external fun nativeAbi(): Int
 }

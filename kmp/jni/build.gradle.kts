@@ -3,7 +3,7 @@ plugins {
 }
 
 android {
-    namespace = "com.librats.jni"
+    namespace = "com.librats"
     compileSdk = libs.versions.android.sdk.compile.get().toInt()
     buildToolsVersion = libs.versions.android.build.tools.get()
 
