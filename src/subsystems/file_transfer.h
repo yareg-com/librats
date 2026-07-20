@@ -7,13 +7,14 @@
  *
  * Push model: the sender offers a file/directory; the receiver accepts (choosing
  * a destination) or rejects; the sender streams the data; the receiver verifies a
- * per-chunk CRC32 and a whole-file SHA-256 before moving each temp file into
- * place. All control + data ride on MessageType::FileChunk as compact binary
- * opcodes (no JSON), implemented on the Node/Subsystem plugin model.
+ * whole-file SHA-256 before moving each temp file into place. All control + data
+ * ride on MessageType::FileChunk as compact binary opcodes (no JSON), implemented
+ * on the Node/Subsystem plugin model.
  *
- * Integrity: every chunk carries a CRC32; every file ends with its SHA-256. A
- * mismatch (or a disk-write failure) fails the whole transfer — a temp file is
- * only moved to its destination after its SHA-256 verifies.
+ * Integrity: every file ends with its SHA-256, verified end-to-end before the temp
+ * file is moved into place; a mismatch (or a disk-write failure) fails the whole
+ * transfer. In transit the Noise session already AEAD-authenticates every byte, so
+ * no redundant per-chunk checksum rides the wire.
  *
  * Backpressure: the sender keeps at most `window_bytes` un-acked; the receiver
  * acks cumulative progress at least twice per window, so the sender never stalls.
@@ -35,7 +36,7 @@
  *   OFFER    [1][id:u64][flags:u8][total:u64][name_len:u16][name][file_count:u32]
  *                                      { [path_len:u16][path][size:u64] } × file_count
  *   RESPONSE [2][id:u64][accept:u8]
- *   CHUNK    [3][id:u64][file_index:u32][offset:u64][crc32:u32][data]
+ *   CHUNK    [3][id:u64][file_index:u32][offset:u64][data]
  *   FILE_END [4][id:u64][file_index:u32][sha256:32]
  *   PROGRESS [5][id:u64][received:u64]      (cumulative across all files)
  *   COMPLETE [6][id:u64][ok:u8]
@@ -48,6 +49,7 @@
 #include "peer/peer.h"
 #include "core/bytes.h"
 #include "peer/peer_id.h"
+#include "util/fs.h"
 
 extern "C" {
 #include "sha256.h"
@@ -76,7 +78,8 @@ public:
         uint32_t    progress_interval    = 256 * 1024;       ///< receiver acks every N bytes
         uint32_t    transfer_timeout_secs = 60;              ///< abort a transfer idle this long
         uint32_t    worker_threads       = 4;                ///< concurrent outgoing transfers
-        bool        verify_integrity     = true;             ///< per-chunk CRC32 + whole-file SHA-256
+        uint32_t    disk_threads         = 4;                ///< receive-side disk-writer pool size
+        bool        verify_integrity     = true;             ///< whole-file SHA-256 end-to-end check
         std::string temp_directory       = ".";              ///< holds in-progress downloads
     };
 
@@ -235,12 +238,23 @@ private:
         uint64_t    size = 0;
         std::string final_path;
         std::string temp_path;
-        uint64_t    received = 0;
+        uint64_t    enqueued = 0;   ///< reactor: bytes handed to the disk writer
+        uint64_t    received = 0;   ///< writer: bytes actually written to disk
         bool        temp_created = false;
-        bool        sha_known = false;
         bool        finalized = false;
-        uint8_t     expected_sha[SHA256_HASH_SIZE]{};
     };
+
+    // A unit of disk work queued by the reactor for the writer pool. A pure data
+    // job carries chunk bytes; a file-end job carries the sender's SHA-256 so the
+    // writer can verify + finalize once all of the file's data is on disk.
+    struct WriteJob {
+        uint32_t fidx = 0;
+        uint64_t offset = 0;
+        Bytes    data;                   ///< chunk bytes (empty for a file-end job)
+        bool     is_file_end = false;
+        uint8_t  sha[SHA256_HASH_SIZE]{};
+    };
+
     struct Incoming {
         uint64_t                   id = 0;
         PeerId                     peer;
@@ -250,16 +264,25 @@ private:
         std::vector<IncomingFile>  files;
 
         std::mutex                 mtx;
-        size_t                     recv_file = 0;
-        uint64_t                   bytes_done = 0;
+        size_t                     recv_file = 0;   ///< reactor cursor: file currently accepting chunks
+        uint64_t                   bytes_done = 0;  ///< writer: total bytes on disk (drives acks/progress)
         uint64_t                   last_ack = 0;
         uint32_t                   files_done = 0;
         Status                     status = Status::Pending;
         bool                       finished = false;
-        sha256_context_t           hash{};
-        uint8_t                    computed_sha[SHA256_HASH_SIZE]{};
         std::chrono::steady_clock::time_point last_activity{};
         RateTracker                rate;
+
+        // ── async disk writer (all fields below the queue are writer-thread only) ─
+        std::queue<WriteJob>       wq;              ///< pending disk jobs (guarded by mtx)
+        uint64_t                   queued_bytes = 0;///< bytes sitting in wq (backpressure)
+        bool                       scheduled = false;///< queued in / owned by the writer pool
+        FileStream                 out;             ///< currently open temp file
+        size_t                     out_idx = SIZE_MAX;
+        int                        hashing_file = -1;///< which file `hash` currently covers
+        sha256_context_t           hash{};
+
+        ~Incoming();  ///< closes `out` and reclaims any un-finalized temp files
     };
 
     // ── message handling (reactor thread) ─────────────────────────────────────
@@ -267,7 +290,7 @@ private:
     void handle_offer(const PeerId& from, uint64_t id, bool is_dir, uint64_t total,
                       std::string name, std::vector<FileEntry> files);
     void handle_chunk(const PeerId& from, uint64_t id, uint32_t fidx, uint64_t offset,
-                      uint32_t crc, ByteView data);
+                      ByteView data);
     void handle_file_end(const PeerId& from, uint64_t id, uint32_t fidx, const uint8_t* sha);
 
     // ── sending ──────────────────────────────────────────────────────────────
@@ -277,7 +300,15 @@ private:
     void     run_send(const std::shared_ptr<Outgoing>& t);
 
     // ── receiving ────────────────────────────────────────────────────────────
-    void try_finalize_file(const std::shared_ptr<Incoming>& t, size_t file_index);
+    // The reactor thread only validates + copies a chunk into the transfer's write
+    // queue; a disk-writer thread does the blocking write, hashing and finalize off
+    // the reactor. `schedule_writer` hands a transfer to the pool (call with the
+    // transfer's mutex NOT held — pool lock is always taken after the transfer's).
+    void schedule_writer(const std::shared_ptr<Incoming>& t);
+    void disk_worker_loop();
+    void drain_writes(const std::shared_ptr<Incoming>& t);
+    void process_data(const std::shared_ptr<Incoming>& t, WriteJob& job);
+    void process_file_end(const std::shared_ptr<Incoming>& t, WriteJob& job);
 
     // ── lifecycle helpers ─────────────────────────────────────────────────────
     void maintenance_loop();
@@ -309,11 +340,19 @@ private:
     std::unordered_map<PeerId, std::unordered_map<uint64_t, std::shared_ptr<Incoming>>,
                        PeerId::Hash> incoming_;
 
-    // worker pool + send queue
+    // send-side worker pool + send queue
     std::vector<std::thread>  workers_;
     std::mutex                queue_mutex_;
     std::condition_variable   queue_cv_;
     std::queue<uint64_t>      send_queue_;
+
+    // receive-side disk-writer pool + ready queue. A transfer is pushed here when it
+    // has pending write jobs; its `scheduled` flag keeps it single-owner so exactly
+    // one worker drains a given transfer at a time (preserving chunk order).
+    std::vector<std::thread>              disk_workers_;
+    std::mutex                            disk_mutex_;
+    std::condition_variable               disk_cv_;
+    std::queue<std::shared_ptr<Incoming>> disk_ready_;
 
     // maintenance (idle timeout / purge)
     std::thread               maintenance_thread_;
