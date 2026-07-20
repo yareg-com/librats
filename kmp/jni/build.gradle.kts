@@ -13,12 +13,12 @@ android {
         ndk {
             abiFilters.addAll(setOf("arm64-v8a", "armeabi-v7a", "x86_64", "x86"))
         }
+    }
 
-        /*externalNativeBuild {
-            cmake {
-                path = file("../cxx/CMakeLists.txt")
-                version = "3.22.1"
-            }
-        }*/
+    externalNativeBuild {
+        cmake {
+            path = file("../../android/src/main/cpp/CMakeLists.txt")
+            version = "3.22.1"
+        }
     }
 }
