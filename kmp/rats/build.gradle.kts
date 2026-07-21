@@ -21,22 +21,17 @@ kotlin {
 
     sourceSets {
         androidMain.dependencies {
-            implementation(project(":jni"))
-        }
-
-        commonMain.dependencies {
-
+            implementation(projects.jni)
         }
     }
 }
 
 // Custom Desktop CMake build task for JVM
-/*
-val buildJvmNativeLib by tasks.registering(Exec::class) {
+/*val buildJvmNativeLib by tasks.registering(Exec::class) {
     val buildDir = file("$buildDir/cmake-build")
     doFirst { buildDir.mkdirs() }
     workingDir = buildDir
-    commandLine("cmake", "../../cxx", "-DCMAKE_BUILD_TYPE=Release")
+    commandLine("cmake", "../../android/src/main/cpp", "-DCMAKE_BUILD_TYPE=Release")
     doLast {
         exec {
             workingDir = buildDir
